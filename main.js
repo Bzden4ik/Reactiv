@@ -30,6 +30,35 @@ app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
 
 /* ---------------- конфиг ---------------- */
 
+// Границы значений парения и полёта: всё, что приходит из настроек или config.json, зажимается в них
+const MOTION_RANGES = {
+  floatAmp: [0, 120],        // размах парения вверх-вниз, px
+  floatPeriod: [1, 12],      // один цикл вверх-вниз, сек
+  roamSpeed: [20, 800],      // скорость полёта, px/сек
+  roamPauseChance: [0, 100], // шанс задержаться на месте после перелёта, %
+  roamPauseMin: [0, 60],     // на сколько задерживается — от, сек
+  roamPauseMax: [0, 120],    // на сколько задерживается — до, сек
+};
+const MOTION_BOOLS = ['float', 'roam', 'roamFaceDirection'];
+const MOTION_KEYS = [...Object.keys(MOTION_RANGES), ...MOTION_BOOLS];
+
+// Оставляет в patch только известные настройки движения с допустимыми значениями
+function sanitizeMotion(patch) {
+  const out = {};
+  if (!patch || typeof patch !== 'object') return out;
+  for (const [k, [lo, hi]] of Object.entries(MOTION_RANGES)) {
+    if (patch[k] === undefined || patch[k] === null || patch[k] === '') continue;
+    const n = Number(patch[k]);
+    if (!Number.isFinite(n)) continue;
+    const v = Math.min(hi, Math.max(lo, n));
+    out[k] = k === 'floatPeriod' ? Math.round(v * 10) / 10 : Math.round(v);
+  }
+  for (const k of MOTION_BOOLS) {
+    if (typeof patch[k] === 'boolean') out[k] = patch[k];
+  }
+  return out;
+}
+
 const cfgPath = path.join(app.getPath('userData'), 'config.json');
 const defaults = {
   url: DEFAULT_URL,
@@ -42,14 +71,30 @@ const defaults = {
   opacity: 1,
   mirror: 'auto',        // 'auto' — лицом к центру экрана, 'off' — не поворачивать, 'on' — всегда отзеркалить
   mirrorInvert: false,   // поменять направление авто-поворота (если исходный персонаж смотрит влево)
+
+  float: true,             // парение вверх-вниз
+  floatAmp: 12,            // размах парения, px
+  floatPeriod: 3.5,        // один цикл вверх-вниз, сек
+  roam: false,             // полёт по всему экрану
+  roamSpeed: 140,          // скорость полёта, px/сек
+  roamPauseChance: 60,     // шанс задержаться на месте после перелёта, %
+  roamPauseMin: 4,         // задерживается не меньше, сек
+  roamPauseMax: 12,        // …и не дольше, сек
+  roamFaceDirection: true, // в полёте смотреть в сторону движения (вместо «лицом к центру экрана»)
 };
 
 function loadCfg() {
+  let c;
   try {
-    return { ...defaults, ...JSON.parse(fs.readFileSync(cfgPath, 'utf8')) };
+    c = { ...defaults, ...JSON.parse(fs.readFileSync(cfgPath, 'utf8')) };
   } catch {
-    return { ...defaults };
+    c = { ...defaults };
   }
+  // Значения движения из старого или испорченного конфига: годные зажимаем в границы, негодные — по умолчанию
+  const ok = sanitizeMotion(c);
+  for (const k of MOTION_KEYS) c[k] = k in ok ? ok[k] : defaults[k];
+  if (c.roamPauseMax < c.roamPauseMin) c.roamPauseMax = c.roamPauseMin;
+  return c;
 }
 function saveCfg() {
   try {
@@ -71,6 +116,25 @@ let saveTimer = null;
 let retryTimer = null;
 let restoreTimer = null;
 let displayChangeUntil = 0; // пока игра меняет разрешение, позицию окна не сохраняем
+let displayChanging = false; // …и пока она его меняет, парение и полёт стоят
+let cfgTimer = null;
+
+// Состояние движка парения и полёта (см. раздел «парение и полёт»)
+const motion = {
+  timer: null,
+  last: 0,          // время прошлого кадра
+  phase: 0,         // фаза парения, рад
+  bx: 0, by: 0,     // «база»: левый верхний угол окна без учёта парения
+  vx: 0, vy: 0,     // скорость базы, px/сек
+  tx: 0, ty: 0,     // куда летим
+  rest: false,      // в цели нужно остановиться (иначе пролетаем мимо к следующей)
+  state: 'idle',    // 'idle' | 'fly' | 'hold'
+  holdLeft: 0,      // сколько ещё стоим на месте, сек
+  heading: 0,       // куда летим по горизонтали: -1 влево, 1 вправо, 0 — ещё не определено
+  w: 0, h: 0,       // размер окна, который нужно сохранять
+  area: null, areaAt: 0, // допустимая область полёта и когда её считали
+  lastX: 0, lastY: 0, frame: 0,
+};
 
 /* ---------------- утилиты ---------------- */
 
@@ -88,6 +152,8 @@ function saveBounds() {
   if (!win || win.isDestroyed()) return;
   if (Date.now() < displayChangeUntil) return; // позиция «поплыла» из-за смены разрешения
   const b = win.getBounds();
+  // Пока окно парит или летает, «домом» считаем базу, а не текущую точку с поправкой на парение
+  if (motion.timer) { b.x = Math.round(motion.bx); b.y = Math.round(motion.by); }
   cfg.x = b.x; cfg.y = b.y; cfg.width = b.width; cfg.height = b.height;
   saveCfg();
 }
@@ -104,6 +170,11 @@ function wantMirror() {
   if (!win || win.isDestroyed()) return false;
   if (cfg.mirror === 'on') return true;
   if (cfg.mirror === 'off') return false;
+  // В полёте смотрим туда, куда летим (если направление уже известно)
+  if (motion.timer && cfg.roam && cfg.roamFaceDirection && motion.heading !== 0) {
+    const lookLeft = motion.heading < 0;
+    return cfg.mirrorInvert ? !lookLeft : lookLeft;
+  }
   const b = win.getBounds();
   const d = screen.getDisplayMatching(b);
   const onRight = b.x + b.width / 2 > d.bounds.x + d.bounds.width / 2;
@@ -141,14 +212,226 @@ function raise() {
 // Ждём, пока всё устаканится, и возвращаем персонажа на сохранённое место.
 function onDisplayChange() {
   displayChangeUntil = Date.now() + 4000;
+  displayChanging = true;
+  motionSync(); // пока Windows двигает окна, парение и полёт стоят
   clearTimeout(restoreTimer);
   restoreTimer = setTimeout(() => {
+    displayChanging = false;
     if (!win || win.isDestroyed()) return;
     const b = { x: cfg.x, y: cfg.y, width: cfg.width, height: cfg.height };
     if (b.x != null && b.y != null && onScreen(b)) win.setBounds(b);
     applyMirror();
     raise();
+    motionSync();
   }, 2500);
+}
+
+/* ---------------- парение и полёт ---------------- */
+
+// Окно двигается сразу двумя слоями: «база» медленно перелетает с места на место (полёт),
+// а поверх неё накладывается покачивание вверх-вниз (парение). Положение окна = база + покачивание.
+
+const TICK_MS = 16;
+const rand = (a, b) => a + Math.random() * (b - a);
+
+function featuresOn() {
+  return (cfg.float && cfg.floatAmp > 0) || cfg.roam;
+}
+
+function motionWanted() {
+  return featuresOn() && !!win && !win.isDestroyed() && win.isVisible() && !editMode && !displayChanging;
+}
+
+// Включает или выключает движок под текущие настройки и состояние окна
+function motionSync() {
+  if (motionWanted()) {
+    if (!motion.timer) motionStart();
+  } else if (motion.timer) {
+    if (featuresOn()) motionPause(); // окно скрыто, его двигают мышкой или меняется разрешение
+    else motionFinish();             // парение и полёт выключены совсем
+  }
+}
+
+function motionPause() {
+  clearInterval(motion.timer);
+  motion.timer = null;
+}
+
+// Всё выключено: оставляем персонажа в точке, где он сейчас «базируется», и запоминаем её
+function motionFinish() {
+  const x = Math.round(motion.bx);
+  const y = Math.round(motion.by);
+  motionPause();
+  if (!win || win.isDestroyed()) return;
+  win.setPosition(x, y);
+  saveBounds();
+  applyMirror();
+}
+
+function motionStart() {
+  const [x, y] = win.getPosition();
+  const [w, h] = win.getSize();
+  Object.assign(motion, {
+    bx: x, by: y, vx: 0, vy: 0, phase: 0, w, h,
+    state: 'idle', holdLeft: 0,
+    area: null, areaAt: 0, lastX: x, lastY: y, frame: 0, last: Date.now(),
+  });
+  motion.timer = setInterval(motionTick, TICK_MS);
+}
+
+// Где базе можно находиться: рабочая область того монитора, на котором сейчас персонаж
+function roamArea() {
+  const now = Date.now();
+  if (motion.area && now - motion.areaAt < 1000) return motion.area;
+  const wa = screen.getDisplayMatching({
+    x: Math.round(motion.bx), y: Math.round(motion.by), width: motion.w, height: motion.h,
+  }).workArea;
+  const padY = cfg.float ? cfg.floatAmp : 0; // чтобы покачивание не выносило окно за край
+  let minX = wa.x;
+  let maxX = wa.x + wa.width - motion.w;
+  let minY = wa.y + padY;
+  let maxY = wa.y + wa.height - motion.h - padY;
+  if (maxX < minX) minX = maxX = Math.round((minX + maxX) / 2); // окно больше экрана — по центру
+  if (maxY < minY) minY = maxY = Math.round((minY + maxY) / 2);
+  motion.area = { minX, maxX, minY, maxY };
+  motion.areaAt = now;
+  return motion.area;
+}
+
+// Выбирает следующее место на экране и решает, остановимся ли там
+function pickTarget() {
+  const a = roamArea();
+  const minDist = Math.min(250, Math.hypot(a.maxX - a.minX, a.maxY - a.minY) * 0.25);
+  let tx = motion.bx;
+  let ty = motion.by;
+  for (let i = 0; i < 10; i++) {
+    tx = rand(a.minX, a.maxX);
+    ty = rand(a.minY, a.maxY);
+    if (Math.hypot(tx - motion.bx, ty - motion.by) >= minDist) break; // не выбираем место прямо под собой
+  }
+  motion.tx = tx;
+  motion.ty = ty;
+  motion.rest = Math.random() * 100 < cfg.roamPauseChance;
+  motion.state = 'fly';
+}
+
+// Гасит скорость базы (когда полёт выключили или персонаж завис на месте)
+function dampVelocity(dt) {
+  const k = 1 - Math.exp(-dt * 5);
+  motion.vx -= motion.vx * k;
+  motion.vy -= motion.vy * k;
+  if (Math.abs(motion.vx) < 0.05) motion.vx = 0;
+  if (Math.abs(motion.vy) < 0.05) motion.vy = 0;
+}
+
+function roamStep(dt) {
+  const a = roamArea();
+  if (motion.state === 'idle') pickTarget();
+
+  if (motion.state === 'hold') {
+    dampVelocity(dt);
+    motion.holdLeft -= dt;
+    if (motion.holdLeft <= 0) pickTarget();
+  }
+
+  if (motion.state === 'fly') {
+    const tx = Math.min(a.maxX, Math.max(a.minX, motion.tx));
+    const ty = Math.min(a.maxY, Math.max(a.minY, motion.ty));
+    const dx = tx - motion.bx;
+    const dy = ty - motion.by;
+    const dist = Math.hypot(dx, dy);
+
+    // Если нужно остановиться — перед целью плавно замедляемся, иначе летим на полной скорости
+    const speed = motion.rest ? Math.min(cfg.roamSpeed, dist * 0.875) : cfg.roamSpeed;
+    const dvx = dist > 0.001 ? (dx / dist) * speed : 0;
+    const dvy = dist > 0.001 ? (dy / dist) * speed : 0;
+    const k = 1 - Math.exp(-dt * 3.5); // скорость нарастает и меняется плавно, без рывков
+    motion.vx += (dvx - motion.vx) * k;
+    motion.vy += (dvy - motion.vy) * k;
+
+    if (motion.rest) {
+      if (dist < 5 && Math.hypot(motion.vx, motion.vy) < 12) {
+        motion.state = 'hold';
+        motion.holdLeft = rand(cfg.roamPauseMin, Math.max(cfg.roamPauseMin, cfg.roamPauseMax));
+        saveBounds(); // запоминаем, где «базируется» персонаж
+      }
+    } else if (dist < Math.max(40, Math.min(160, cfg.roamSpeed * 0.5))) {
+      pickTarget(); // место «по пути» — не останавливаемся, сразу летим дальше
+    }
+  }
+
+  motion.bx = Math.min(a.maxX, Math.max(a.minX, motion.bx + motion.vx * dt));
+  motion.by = Math.min(a.maxY, Math.max(a.minY, motion.by + motion.vy * dt));
+
+  // Куда смотрит персонаж: порог, чтобы почти вертикальный полёт не вертел его туда-сюда
+  if (Math.abs(motion.vx) > 15) {
+    const h = motion.vx > 0 ? 1 : -1;
+    if (h !== motion.heading) { motion.heading = h; applyMirror(); }
+  }
+}
+
+// Полёт выключен — база просто дотормаживает и остаётся на месте
+function settle(dt) {
+  motion.state = 'idle';
+  dampVelocity(dt);
+  motion.bx += motion.vx * dt;
+  motion.by += motion.vy * dt;
+}
+
+// Раз в пару секунд проверяем, что окно не «поплыло» по размеру
+// (на Windows с масштабом экрана не 100% повторные setPosition иногда сдвигают размер на пиксель)
+function keepSize() {
+  const [w, h] = win.getSize();
+  if (w !== motion.w || h !== motion.h) {
+    win.setBounds({ x: motion.lastX, y: motion.lastY, width: motion.w, height: motion.h });
+  }
+}
+
+function motionTick() {
+  if (!motionWanted()) { motionSync(); return; }
+  const now = Date.now();
+  const dt = Math.min(0.1, Math.max(0, (now - motion.last) / 1000));
+  motion.last = now;
+
+  if (cfg.roam) roamStep(dt); else settle(dt);
+
+  motion.phase = (motion.phase + (2 * Math.PI * dt) / cfg.floatPeriod) % (2 * Math.PI);
+  const amp = cfg.float ? cfg.floatAmp : 0;
+  const x = Math.round(motion.bx);
+  const y = Math.round(motion.by + amp * Math.sin(motion.phase));
+  if (x !== motion.lastX || y !== motion.lastY) {
+    motion.lastX = x;
+    motion.lastY = y;
+    win.setPosition(x, y);
+  }
+
+  motion.frame++;
+  if (motion.frame % 120 === 0) keepSize();
+  // Если направление взгляда не привязано к полёту, «лицом к центру» проверяем пореже, а не на каждый кадр
+  if (motion.frame % 8 === 0 && cfg.roam && !cfg.roamFaceDirection) applyMirror();
+}
+
+function motionSettings() {
+  return Object.fromEntries(MOTION_KEYS.map((k) => [k, cfg[k]]));
+}
+
+// Применяет изменения настроек движения «на лету»; fromWc — окно настроек, которому слать ответ не нужно
+function applyMotionPatch(patch, fromWc) {
+  const clean = sanitizeMotion(patch);
+  const keys = Object.keys(clean);
+  if (!keys.length) return;
+  Object.assign(cfg, clean);
+  if (cfg.roamPauseMax < cfg.roamPauseMin) {
+    if ('roamPauseMin' in clean) cfg.roamPauseMax = cfg.roamPauseMin; else cfg.roamPauseMin = cfg.roamPauseMax;
+  }
+  clearTimeout(cfgTimer);
+  cfgTimer = setTimeout(saveCfg, 300);
+  motionSync();
+  applyMirror();
+  if (keys.some((k) => MOTION_BOOLS.includes(k))) rebuildMenu();
+  if (settingsWin && !settingsWin.isDestroyed() && settingsWin.webContents !== fromWc) {
+    settingsWin.webContents.send('settings:motion-changed', motionSettings());
+  }
 }
 
 /* ---------------- окно персонажа ---------------- */
@@ -203,14 +486,17 @@ function createWindow() {
   });
 
   win.on('move', () => {
+    // Окном управляет парение/полёт: позицию не сохраняем, а поворот решает сам движок
+    if (motion.timer) return;
     applyMirror(); // сразу разворачиваем, как только окно пересекло середину экрана
     clearTimeout(saveTimer);
     saveTimer = setTimeout(saveBounds, 400);
   });
-  win.on('closed', () => { win = null; });
+  win.on('closed', () => { motionPause(); win = null; });
 
   win.loadURL(cfg.url);
   win.showInactive();
+  motionSync();
 }
 
 async function refreshCss() {
@@ -242,6 +528,7 @@ async function setEditMode(on) {
     win.setFocusable(false);
     saveBounds();
   }
+  motionSync(); // пока окно двигают мышкой, парение и полёт на паузе; после фиксации летаем от нового места
   await refreshCss();
   rebuildMenu();
 }
@@ -249,11 +536,15 @@ async function setEditMode(on) {
 function setSize(w, h) {
   if (!win || win.isDestroyed()) return;
   const b = win.getBounds();
+  if (motion.timer) { b.x = Math.round(motion.bx); b.y = Math.round(motion.by); } // центр считаем от базы, без парения
   const nw = clamp(Math.round(w), 120, 3000);
   const nh = clamp(Math.round(h), 120, 3000);
   const cx = b.x + b.width / 2;
   const cy = b.y + b.height / 2;
-  win.setBounds({ x: Math.round(cx - nw / 2), y: Math.round(cy - nh / 2), width: nw, height: nh });
+  const nx = Math.round(cx - nw / 2);
+  const ny = Math.round(cy - nh / 2);
+  win.setBounds({ x: nx, y: ny, width: nw, height: nh });
+  if (motion.timer) Object.assign(motion, { bx: nx, by: ny, w: nw, h: nh, lastX: nx, lastY: ny, area: null });
   applyMirror();
   saveBounds();
 }
@@ -267,6 +558,7 @@ function scaleWindow(factor) {
 function toggleVisible() {
   if (!win || win.isDestroyed()) return;
   if (win.isVisible()) win.hide(); else { win.showInactive(); raise(); }
+  motionSync(); // скрытое окно не двигаем
   rebuildMenu();
 }
 
@@ -278,9 +570,10 @@ function reload() {
 
 function openSettings() {
   if (settingsWin) { settingsWin.focus(); return; }
+  const wa = screen.getPrimaryDisplay().workArea;
   settingsWin = new BrowserWindow({
     width: 480,
-    height: 380,
+    height: Math.min(720, wa.height - 40),
     resizable: false,
     minimizable: false,
     maximizable: false,
@@ -301,7 +594,23 @@ function openSettings() {
 
 ipcMain.handle('settings:get', (e) => {
   if (!settingsWin || e.sender !== settingsWin.webContents) return null;
-  return { url: cfg.url, width: cfg.width, height: cfg.height };
+  return { url: cfg.url, width: cfg.width, height: cfg.height, motion: motionSettings() };
+});
+
+// Парение и полёт применяются сразу, как только двигают ползунок; в ответ — актуальные значения
+ipcMain.handle('settings:motion', (e, patch) => {
+  if (!settingsWin || e.sender !== settingsWin.webContents) return null;
+  applyMotionPatch(patch, e.sender);
+  return motionSettings();
+});
+
+// Сброс только числовых значений; переключатели «Парение» / «Полёт» не трогаем
+ipcMain.handle('settings:motion-reset', (e) => {
+  if (!settingsWin || e.sender !== settingsWin.webContents) return null;
+  const numeric = {};
+  for (const k of Object.keys(MOTION_RANGES)) numeric[k] = defaults[k];
+  applyMotionPatch(numeric, e.sender);
+  return motionSettings();
 });
 
 ipcMain.handle('settings:save', (e, data) => {
@@ -366,6 +675,15 @@ function buildMenu() {
       ],
     },
     {
+      label: 'Парение и полёт',
+      submenu: [
+        { label: 'Парение (вверх-вниз)', type: 'checkbox', checked: !!cfg.float, click: (item) => applyMotionPatch({ float: item.checked }) },
+        { label: 'Полёт по всему экрану', type: 'checkbox', checked: !!cfg.roam, click: (item) => applyMotionPatch({ roam: item.checked }) },
+        { type: 'separator' },
+        { label: 'Настроить скорость, размах, паузы…', click: openSettings },
+      ],
+    },
+    {
       label: 'Прозрачность',
       submenu: [1, 0.8, 0.6, 0.4].map((v) => ({
         label: `${Math.round(v * 100)}%`,
@@ -391,7 +709,7 @@ function buildMenu() {
       click: (item) => { cfg.autostart = item.checked; applyAutostart(); saveCfg(); },
     },
     { type: 'separator' },
-    { label: 'Настройки… (ссылка, размер)', click: openSettings },
+    { label: 'Настройки… (ссылка, размер, движение)', click: openSettings },
     { label: 'Перезагрузить персонажа (Ctrl+Alt+R)', click: reload },
     { type: 'separator' },
     { label: 'Выход', click: () => app.quit() },
@@ -452,8 +770,10 @@ app.whenReady().then(() => {
 });
 
 app.on('second-instance', () => {
-  if (win && !win.isDestroyed() && !win.isVisible()) { win.showInactive(); raise(); }
+  if (win && !win.isDestroyed() && !win.isVisible()) { win.showInactive(); raise(); motionSync(); }
 });
 
 app.on('window-all-closed', () => { /* живём в трее */ });
+// При выходе запоминаем, где «базировался» персонаж, чтобы в следующий раз начать оттуда
+app.on('before-quit', () => { if (motion.timer) saveBounds(); });
 app.on('will-quit', () => globalShortcut.unregisterAll());
