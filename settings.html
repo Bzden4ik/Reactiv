@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<title>Настройки</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 22px; background: #16161d; color: #e8e8f0;
+         font: 14px/1.4 "Segoe UI", system-ui, sans-serif; }
+  h1 { font-size: 17px; margin: 0 0 16px; }
+  label { display: block; margin: 14px 0 6px; color: #a9a9c0; font-size: 12.5px; }
+  input { width: 100%; box-sizing: border-box; padding: 9px 10px; border-radius: 8px;
+          border: 1px solid #34344a; background: #1f1f2b; color: inherit; font: inherit; }
+  input:focus { outline: 2px solid #8b5cf6; border-color: transparent; }
+  .row { display: flex; gap: 12px; }
+  .row > div { flex: 1; }
+  .actions { display: flex; gap: 10px; align-items: center; margin-top: 22px; }
+  button { padding: 9px 18px; border-radius: 8px; border: 0; background: #8b5cf6; color: #fff;
+           font: inherit; cursor: pointer; }
+  button.secondary { background: #2b2b3b; }
+  #status { font-size: 12.5px; color: #a9a9c0; }
+  #status.err { color: #ff8a8a; }
+  p.hint { margin: 6px 0 0; font-size: 12px; color: #7d7d96; }
+</style>
+</head>
+<body>
+  <h1>Reactive Avatar</h1>
+
+  <label for="url">Ссылка на персонажа (Browser Source из Reactive)</label>
+  <input id="url" type="url" spellcheck="false" placeholder="https://reactive.fugi.tech/basic/...">
+  <p class="hint">Индивидуальная ссылка из раздела Links на сайте Reactive.</p>
+
+  <div class="row">
+    <div><label for="w">Ширина, px</label><input id="w" type="number" min="120" max="3000"></div>
+    <div><label for="h">Высота, px</label><input id="h" type="number" min="120" max="3000"></div>
+  </div>
+
+  <div class="actions">
+    <button id="save">Сохранить</button>
+    <button id="close" class="secondary">Закрыть</button>
+    <span id="status"></span>
+  </div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const status = (t, err) => { $('status').textContent = t; $('status').className = err ? 'err' : ''; };
+
+  api.get().then((c) => {
+    if (!c) return;
+    $('url').value = c.url; $('w').value = c.width; $('h').value = c.height;
+  });
+
+  $('save').addEventListener('click', async () => {
+    const r = await api.save({ url: $('url').value, width: $('w').value, height: $('h').value });
+    if (r && r.ok) status('Сохранено'); else status((r && r.error) || 'Ошибка', true);
+  });
+  $('close').addEventListener('click', () => api.close());
+</script>
+</body>
+</html>
