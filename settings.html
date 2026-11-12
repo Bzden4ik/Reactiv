@@ -9,10 +9,12 @@
   body { margin: 0; padding: 22px; background: #16161d; color: #e8e8f0;
          font: 14px/1.4 "Segoe UI", system-ui, sans-serif; }
   h1 { font-size: 17px; margin: 0 0 16px; }
+  h2 { font-size: 14px; margin: 26px 0 4px; padding-top: 18px; border-top: 1px solid #2b2b3b; }
   label { display: block; margin: 14px 0 6px; color: #a9a9c0; font-size: 12.5px; }
-  input { width: 100%; box-sizing: border-box; padding: 9px 10px; border-radius: 8px;
-          border: 1px solid #34344a; background: #1f1f2b; color: inherit; font: inherit; }
-  input:focus { outline: 2px solid #8b5cf6; border-color: transparent; }
+  input[type=url], input[type=number] {
+    width: 100%; box-sizing: border-box; padding: 9px 10px; border-radius: 8px;
+    border: 1px solid #34344a; background: #1f1f2b; color: inherit; font: inherit; }
+  input[type=url]:focus, input[type=number]:focus { outline: 2px solid #8b5cf6; border-color: transparent; }
   .row { display: flex; gap: 12px; }
   .row > div { flex: 1; }
   .actions { display: flex; gap: 10px; align-items: center; margin-top: 22px; }
@@ -22,6 +24,17 @@
   #status { font-size: 12.5px; color: #a9a9c0; }
   #status.err { color: #ff8a8a; }
   p.hint { margin: 6px 0 0; font-size: 12px; color: #7d7d96; }
+
+  /* движение */
+  label.check { display: flex; align-items: center; gap: 9px; margin: 14px 0 4px; color: #e8e8f0;
+                font-size: 14px; cursor: pointer; }
+  input[type=checkbox] { width: 16px; height: 16px; margin: 0; accent-color: #8b5cf6; }
+  .slider { margin: 10px 0 0 25px; transition: opacity .15s; }
+  .slider .top { display: flex; justify-content: space-between; color: #a9a9c0; font-size: 12.5px; }
+  .slider .top span.val { color: #e8e8f0; font-variant-numeric: tabular-nums; }
+  input[type=range] { width: 100%; margin: 4px 0 0; accent-color: #8b5cf6; }
+  .slider.off { opacity: .4; }
+  p.hint.indent { margin-left: 25px; }
 </style>
 </head>
 <body>
@@ -42,14 +55,105 @@
     <span id="status"></span>
   </div>
 
+  <h2>Движение</h2>
+  <p class="hint">Меняется сразу, пока двигаешь ползунки, — кнопка «Сохранить» для этого не нужна.</p>
+
+  <label class="check"><input type="checkbox" data-key="float"> Парение вверх-вниз</label>
+  <div class="slider" data-group="float">
+    <div class="top"><span>Размах</span><span class="val" data-val="floatAmp"></span></div>
+    <input type="range" data-key="floatAmp" min="0" max="120" step="1">
+  </div>
+  <div class="slider" data-group="float">
+    <div class="top"><span>Один цикл вверх-вниз</span><span class="val" data-val="floatPeriod"></span></div>
+    <input type="range" data-key="floatPeriod" min="1" max="12" step="0.1">
+  </div>
+
+  <label class="check"><input type="checkbox" data-key="roam"> Полёт по всему экрану</label>
+  <div class="slider" data-group="roam">
+    <div class="top"><span>Скорость полёта</span><span class="val" data-val="roamSpeed"></span></div>
+    <input type="range" data-key="roamSpeed" min="20" max="800" step="10">
+  </div>
+  <div class="slider" data-group="roam">
+    <div class="top"><span>Как часто зависает на месте</span><span class="val" data-val="roamPauseChance"></span></div>
+    <input type="range" data-key="roamPauseChance" min="0" max="100" step="5">
+  </div>
+  <div class="slider" data-group="roam">
+    <div class="top"><span>Зависает не меньше</span><span class="val" data-val="roamPauseMin"></span></div>
+    <input type="range" data-key="roamPauseMin" min="0" max="60" step="1">
+  </div>
+  <div class="slider" data-group="roam">
+    <div class="top"><span>…и не дольше</span><span class="val" data-val="roamPauseMax"></span></div>
+    <input type="range" data-key="roamPauseMax" min="0" max="120" step="1">
+  </div>
+  <label class="check" data-group="roam"><input type="checkbox" data-key="roamFaceDirection"> Смотреть в сторону полёта</label>
+  <p class="hint indent">Работает при «Повороте персонажа» в режиме «Авто» (меню в трее).</p>
+
+  <div class="actions">
+    <button id="reset" class="secondary">Сбросить значения</button>
+  </div>
+
 <script>
   const $ = (id) => document.getElementById(id);
   const status = (t, err) => { $('status').textContent = t; $('status').className = err ? 'err' : ''; };
 
+  const UNITS = {
+    floatAmp: (v) => v + ' px',
+    floatPeriod: (v) => Number(v).toFixed(1) + ' с',
+    roamSpeed: (v) => v + ' px/с',
+    roamPauseChance: (v) => v + ' %',
+    roamPauseMin: (v) => v + ' с',
+    roamPauseMax: (v) => v + ' с',
+  };
+
+  const controls = [...document.querySelectorAll('[data-key]')];
+
+  // Показывает значения из настроек; элемент, который сейчас тянут, не трогаем, чтобы он не «дёргался»
+  function render(m) {
+    if (!m) return;
+    for (const el of controls) {
+      const v = m[el.dataset.key];
+      if (v === undefined) continue;
+      if (el !== document.activeElement) {
+        if (el.type === 'checkbox') el.checked = !!v; else el.value = v;
+      }
+      const out = document.querySelector('[data-val="' + el.dataset.key + '"]');
+      if (out) out.textContent = UNITS[el.dataset.key](v);
+    }
+    // Ползунки выключенной функции приглушаем
+    for (const g of document.querySelectorAll('.slider[data-group]')) {
+      const on = !!m[g.dataset.group];
+      g.classList.toggle('off', !on);
+      g.querySelector('input').disabled = !on;
+    }
+    document.querySelector('label.check[data-group="roam"] input').disabled = !m.roam;
+  }
+
   api.get().then((c) => {
     if (!c) return;
     $('url').value = c.url; $('w').value = c.width; $('h').value = c.height;
+    render(c.motion);
   });
+  api.onMotion(render); // например, переключили галочку в меню трея
+
+  // Изменения шлём не чаще раза в 40 мс, пока тянут ползунок
+  let pending = {};
+  let timer = null;
+  function flush() {
+    timer = null;
+    const patch = pending;
+    pending = {};
+    api.setMotion(patch).then(render);
+  }
+  for (const el of controls) {
+    el.addEventListener('input', () => {
+      const v = el.type === 'checkbox' ? el.checked : Number(el.value);
+      const out = document.querySelector('[data-val="' + el.dataset.key + '"]');
+      if (out && el.type !== 'checkbox') out.textContent = UNITS[el.dataset.key](v);
+      pending[el.dataset.key] = v;
+      if (!timer) timer = setTimeout(flush, 40);
+    });
+  }
+  $('reset').addEventListener('click', () => api.resetMotion().then(render));
 
   $('save').addEventListener('click', async () => {
     const r = await api.save({ url: $('url').value, width: $('w').value, height: $('h').value });
