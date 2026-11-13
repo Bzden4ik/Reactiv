@@ -38,8 +38,11 @@ const MOTION_RANGES = {
   roamPauseChance: [0, 100], // шанс задержаться на месте после перелёта, %
   roamPauseMin: [0, 60],     // на сколько задерживается — от, сек
   roamPauseMax: [0, 120],    // на сколько задерживается — до, сек
+  evadeRadius: [60, 600],    // на каком расстоянии от курсора персонаж начинает убегать, px
+  evadeDistance: [20, 500],  // на сколько отлетает за один рывок, px
+  evadeSpeed: [20, 800],     // скорость убегания, px/сек
 };
-const MOTION_BOOLS = ['float', 'roam', 'roamFaceDirection'];
+const MOTION_BOOLS = ['float', 'roam', 'roamFaceDirection', 'evade', 'evadeOrbit', 'clickFx'];
 const MOTION_KEYS = [...Object.keys(MOTION_RANGES), ...MOTION_BOOLS];
 
 // Оставляет в patch только известные настройки движения с допустимыми значениями
@@ -81,6 +84,13 @@ const defaults = {
   roamPauseMin: 4,         // задерживается не меньше, сек
   roamPauseMax: 12,        // …и не дольше, сек
   roamFaceDirection: true, // в полёте смотреть в сторону движения (вместо «лицом к центру экрана»)
+
+  evade: false,            // убегать от курсора
+  evadeRadius: 200,        // начинает убегать, когда курсор ближе, px
+  evadeDistance: 150,      // за один рывок отлетает не дальше, px
+  evadeSpeed: 70,          // скорость убегания, px/сек
+  evadeOrbit: true,        // если прижат к краю экрана — облетать курсор по дуге
+  clickFx: true,           // пружинка и блёстки при клике по персонажу
 };
 
 function loadCfg() {
@@ -134,6 +144,8 @@ const motion = {
   w: 0, h: 0,       // размер окна, который нужно сохранять
   area: null, areaAt: 0, // допустимая область полёта и когда её считали
   lastX: 0, lastY: 0, frame: 0,
+  ev: { on: false, left: 0, cool: 0, side: 0, vx: 0, vy: 0 }, // убегание от курсора
+  over: false,      // курсор над персонажем (окно временно принимает клики)
 };
 
 /* ---------------- утилиты ---------------- */
@@ -235,7 +247,7 @@ const TICK_MS = 16;
 const rand = (a, b) => a + Math.random() * (b - a);
 
 function featuresOn() {
-  return (cfg.float && cfg.floatAmp > 0) || cfg.roam;
+  return (cfg.float && cfg.floatAmp > 0) || cfg.roam || cfg.evade || cfg.clickFx;
 }
 
 function motionWanted() {
@@ -255,6 +267,10 @@ function motionSync() {
 function motionPause() {
   clearInterval(motion.timer);
   motion.timer = null;
+  if (motion.over) {
+    motion.over = false;
+    if (win && !win.isDestroyed() && !editMode) win.setIgnoreMouseEvents(true, { forward: true });
+  }
 }
 
 // Всё выключено: оставляем персонажа в точке, где он сейчас «базируется», и запоминаем её
@@ -275,6 +291,7 @@ function motionStart() {
     bx: x, by: y, vx: 0, vy: 0, phase: 0, w, h,
     state: 'idle', holdLeft: 0,
     area: null, areaAt: 0, lastX: x, lastY: y, frame: 0, last: Date.now(),
+    ev: { on: false, left: 0, cool: 0, side: 0, vx: 0, vy: 0 }, over: false,
   });
   motion.timer = setInterval(motionTick, TICK_MS);
 }
@@ -378,6 +395,111 @@ function settle(dt) {
   motion.by += motion.vy * dt;
 }
 
+// Сколько пикселей центр персонажа может пролететь от точки (px, py) в направлении (ux, uy), не выйдя из области
+function rayRoom(px, py, ux, uy, a, hw, hh) {
+  let t = Infinity;
+  if (ux > 1e-6) t = Math.min(t, (a.maxX + hw - px) / ux);
+  else if (ux < -1e-6) t = Math.min(t, (a.minX + hw - px) / ux);
+  if (uy > 1e-6) t = Math.min(t, (a.maxY + hh - py) / uy);
+  else if (uy < -1e-6) t = Math.min(t, (a.minY + hh - py) / uy);
+  return Math.max(0, t);
+}
+
+// Убегание от курсора. Работает рывками: курсор подошёл ближе радиуса — персонаж плавно отлетает
+// не дальше заданной дистанции, потом короткая пауза и, если курсор всё ещё рядом, следующий рывок.
+// Если путь прижат к краю экрана, направление поворачивается по касательной — персонаж облетает курсор по дуге.
+// Возвращает true, пока персонаж убегает (в это время обычный полёт стоит).
+function evadeStep(dt) {
+  const ev = motion.ev;
+  if (!cfg.evade) {
+    if (ev.on || ev.cool > 0 || ev.vx || ev.vy) Object.assign(ev, { on: false, left: 0, cool: 0, side: 0, vx: 0, vy: 0 });
+    return false;
+  }
+  const a = roamArea();
+  const c = screen.getCursorScreenPoint();
+  const hw = motion.w / 2;
+  const hh = motion.h / 2;
+  const px = motion.bx + hw;
+  const py = motion.by + hh;
+  let dx = px - c.x;
+  let dy = py - c.y;
+  let d = Math.hypot(dx, dy);
+  if (d < 1) { dx = 1; dy = 0; d = 1; }
+  const R = cfg.evadeRadius;
+
+  if (ev.cool > 0) ev.cool -= dt;
+  if (!ev.on && ev.cool <= 0 && d < R) {
+    ev.on = true;
+    ev.left = cfg.evadeDistance;
+    ev.side = 0;
+  }
+  if (ev.on && (ev.left <= 0 || d > R * 1.15)) {
+    ev.on = false;
+    ev.cool = 0.5;
+    ev.side = 0;
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(saveBounds, 800); // запоминаем, где остановился
+  }
+
+  let wx = 0;
+  let wy = 0;
+  if (ev.on) {
+    let ux = dx / d;
+    let uy = dy / d;
+    if (cfg.evadeOrbit) {
+      const room = rayRoom(px, py, ux, uy, a, hw, hh);
+      const b = clamp(1 - room / Math.max(cfg.evadeDistance, 60), 0, 1); // 0 — путь свободен, 1 — упёрлись в край
+      if (b > 0) {
+        if (!ev.side) { // в какую сторону обходить: туда, где на экране больше места
+          const cx = (a.minX + a.maxX) / 2 + hw - px;
+          const cy = (a.minY + a.maxY) / 2 + hh - py;
+          ev.side = (-uy * cx + ux * cy) >= 0 ? 1 : -1;
+        }
+        const tx = -uy * ev.side;
+        const ty = ux * ev.side;
+        ux = ux * (1 - b) + tx * b;
+        uy = uy * (1 - b) + ty * b;
+        const n = Math.hypot(ux, uy) || 1;
+        ux /= n;
+        uy /= n;
+      }
+    }
+    const sp = cfg.evadeSpeed * clamp(0.5 + (1 - d / R), 0.5, 1); // чем ближе курсор, тем бодрее
+    wx = ux * sp;
+    wy = uy * sp;
+  }
+  const k = 1 - Math.exp(-dt * (ev.on ? 5 : 8));
+  ev.vx += (wx - ev.vx) * k;
+  ev.vy += (wy - ev.vy) * k;
+  if (!ev.on && Math.hypot(ev.vx, ev.vy) < 3) { ev.vx = 0; ev.vy = 0; }
+
+  const nx = clamp(motion.bx + ev.vx * dt, a.minX, a.maxX);
+  const ny = clamp(motion.by + ev.vy * dt, a.minY, a.maxY);
+  if (ev.on) ev.left -= Math.hypot(nx - motion.bx, ny - motion.by);
+  motion.bx = nx;
+  motion.by = ny;
+  return ev.on || ev.cool > 0 || ev.vx !== 0 || ev.vy !== 0;
+}
+
+// Пока курсор над персонажем, окно принимает клики (иначе они проходят сквозь него).
+// Вне персонажа окно снова «прозрачное» для мыши.
+function hoverStep() {
+  let over = false;
+  if (cfg.clickFx && !editMode) {
+    const c = screen.getCursorScreenPoint();
+    const b = win.getBounds();
+    const rx = b.width * 0.32;
+    const ry = b.height * 0.45;
+    const nx = (c.x - (b.x + b.width / 2)) / rx;
+    const ny = (c.y - (b.y + b.height / 2)) / ry;
+    over = nx * nx + ny * ny <= 1;
+  }
+  if (over === motion.over) return;
+  motion.over = over;
+  if (over) win.setIgnoreMouseEvents(false);
+  else win.setIgnoreMouseEvents(true, { forward: true });
+}
+
 // Раз в пару секунд проверяем, что окно не «поплыло» по размеру
 // (на Windows с масштабом экрана не 100% повторные setPosition иногда сдвигают размер на пиксель)
 function keepSize() {
@@ -393,7 +515,9 @@ function motionTick() {
   const dt = Math.min(0.1, Math.max(0, (now - motion.last) / 1000));
   motion.last = now;
 
-  if (cfg.roam) roamStep(dt); else settle(dt);
+  if (evadeStep(dt)) settle(dt); // убегаем от курсора — обычный полёт на паузе
+  else if (cfg.roam) roamStep(dt);
+  else settle(dt);
 
   motion.phase = (motion.phase + (2 * Math.PI * dt) / cfg.floatPeriod) % (2 * Math.PI);
   const amp = cfg.float ? cfg.floatAmp : 0;
@@ -404,6 +528,8 @@ function motionTick() {
     motion.lastY = y;
     win.setPosition(x, y);
   }
+
+  hoverStep();
 
   motion.frame++;
   if (motion.frame % 120 === 0) keepSize();
@@ -478,6 +604,7 @@ function createWindow() {
     mirrored = null;
     applyMirror(true);
     refreshCss();
+    injectFx();
   });
   wc.on('did-fail-load', (_e, code, _desc, _url, isMainFrame) => {
     if (!isMainFrame || code === -3) return; // -3 = отмена загрузки
@@ -497,6 +624,105 @@ function createWindow() {
   win.loadURL(cfg.url);
   win.showInactive();
   motionSync();
+}
+
+// Пружинка и блёстки при клике: скрипт выполняется внутри страницы персонажа
+function fxPage() {
+  if (window.__raFx) return;
+  window.__raFx = true;
+  const cv = document.createElement('canvas');
+  cv.style.cssText = 'position:fixed;left:0;top:0;width:100vw;height:100vh;pointer-events:none;z-index:2147483647';
+  document.documentElement.appendChild(cv);
+  const ctx = cv.getContext('2d');
+  const fit = () => {
+    const d = window.devicePixelRatio || 1;
+    cv.width = Math.round(innerWidth * d);
+    cv.height = Math.round(innerHeight * d);
+    ctx.setTransform(d, 0, 0, d, 0, 0);
+  };
+  fit();
+  addEventListener('resize', fit);
+
+  const COLORS = ['#ffd75e', '#fff4b8', '#c4a8ff', '#a78bfa', '#ffffff'];
+  let parts = [];
+  let raf = 0;
+  let last = 0;
+
+  const star = (x, y, r, rot) => {
+    ctx.beginPath();
+    for (let i = 0; i < 8; i++) {
+      const a = rot + (i * Math.PI) / 4;
+      const rr = i % 2 ? r * 0.35 : r;
+      ctx.lineTo(x + Math.cos(a) * rr, y + Math.sin(a) * rr);
+    }
+    ctx.closePath();
+    ctx.fill();
+  };
+
+  const frame = (t) => {
+    const dt = Math.min(0.05, (t - last) / 1000);
+    last = t;
+    ctx.clearRect(0, 0, innerWidth, innerHeight);
+    parts = parts.filter((p) => p.life > 0);
+    for (const p of parts) {
+      p.life -= dt;
+      p.vy += 520 * dt;
+      p.vx *= 1 - 1.2 * dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.rot += p.spin * dt;
+      ctx.globalAlpha = Math.max(0, p.life / p.max);
+      ctx.fillStyle = p.color;
+      ctx.shadowColor = p.color;
+      ctx.shadowBlur = 8;
+      star(p.x, p.y, p.size * (0.6 + 0.4 * (p.life / p.max)), p.rot);
+    }
+    ctx.globalAlpha = 1;
+    ctx.shadowBlur = 0;
+    raf = parts.length ? requestAnimationFrame(frame) : 0;
+  };
+
+  const burst = (x, y) => {
+    for (let i = 0; i < 28; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const v = 140 + Math.random() * 260;
+      const life = 0.7 + Math.random() * 0.6;
+      parts.push({
+        x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 140,
+        life, max: life, size: 3 + Math.random() * 5,
+        rot: Math.random() * 6.28, spin: (Math.random() - 0.5) * 10,
+        color: COLORS[(Math.random() * COLORS.length) | 0],
+      });
+    }
+    if (!raf) { last = performance.now(); raf = requestAnimationFrame(frame); }
+  };
+
+  let anim = null;
+  const spring = () => {
+    if (anim) anim.cancel();
+    const ease = 'cubic-bezier(.3,.7,.4,1)';
+    anim = document.body.animate([
+      { transform: 'scale(1,1)', transformOrigin: '50% 85%', easing: ease },
+      { transform: 'scale(1.16,0.8)', transformOrigin: '50% 85%', offset: 0.16, easing: ease },
+      { transform: 'scale(0.92,1.13)', transformOrigin: '50% 85%', offset: 0.38, easing: ease },
+      { transform: 'scale(1.05,0.96)', transformOrigin: '50% 85%', offset: 0.58, easing: ease },
+      { transform: 'scale(0.99,1.01)', transformOrigin: '50% 85%', offset: 0.78, easing: ease },
+      { transform: 'scale(1,1)', transformOrigin: '50% 85%' },
+    ], { duration: 700 });
+  };
+
+  addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    // Если страница отзеркалена (поворот персонажа), холст отзеркален вместе с ней
+    const flip = new DOMMatrix(getComputedStyle(document.documentElement).transform).a < 0;
+    burst(flip ? innerWidth - e.clientX : e.clientX, e.clientY);
+    spring();
+  }, true);
+}
+
+function injectFx() {
+  if (!win || win.isDestroyed()) return;
+  win.webContents.executeJavaScript(`(${fxPage.toString()})()`).catch(() => { /* страница ещё не готова */ });
 }
 
 async function refreshCss() {
@@ -679,6 +905,10 @@ function buildMenu() {
       submenu: [
         { label: 'Парение (вверх-вниз)', type: 'checkbox', checked: !!cfg.float, click: (item) => applyMotionPatch({ float: item.checked }) },
         { label: 'Полёт по всему экрану', type: 'checkbox', checked: !!cfg.roam, click: (item) => applyMotionPatch({ roam: item.checked }) },
+        { type: 'separator' },
+        { label: 'Убегать от курсора', type: 'checkbox', checked: !!cfg.evade, click: (item) => applyMotionPatch({ evade: item.checked }) },
+        { label: 'Облетать курсор', type: 'checkbox', checked: !!cfg.evadeOrbit, click: (item) => applyMotionPatch({ evadeOrbit: item.checked }) },
+        { label: 'Пружинка и блёстки при клике', type: 'checkbox', checked: !!cfg.clickFx, click: (item) => applyMotionPatch({ clickFx: item.checked }) },
         { type: 'separator' },
         { label: 'Настроить скорость, размах, паузы…', click: openSettings },
       ],

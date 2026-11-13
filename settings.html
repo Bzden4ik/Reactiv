@@ -88,6 +88,24 @@
   <label class="check" data-group="roam"><input type="checkbox" data-key="roamFaceDirection"> Смотреть в сторону полёта</label>
   <p class="hint indent">Работает при «Повороте персонажа» в режиме «Авто» (меню в трее).</p>
 
+  <label class="check"><input type="checkbox" data-key="evade"> Убегать от курсора</label>
+  <div class="slider" data-group="evade">
+    <div class="top"><span>Начинает убегать, когда курсор ближе</span><span class="val" data-val="evadeRadius"></span></div>
+    <input type="range" data-key="evadeRadius" min="60" max="600" step="10">
+  </div>
+  <div class="slider" data-group="evade">
+    <div class="top"><span>Отлетает за один раз не дальше</span><span class="val" data-val="evadeDistance"></span></div>
+    <input type="range" data-key="evadeDistance" min="20" max="500" step="10">
+  </div>
+  <div class="slider" data-group="evade">
+    <div class="top"><span>Скорость убегания</span><span class="val" data-val="evadeSpeed"></span></div>
+    <input type="range" data-key="evadeSpeed" min="20" max="800" step="10">
+  </div>
+  <label class="check" data-group="evade"><input type="checkbox" data-key="evadeOrbit"> Облетать курсор, если прижат к краю</label>
+
+  <label class="check"><input type="checkbox" data-key="clickFx"> Пружинка и блёстки при клике</label>
+  <p class="hint indent">Пока курсор над персонажем, клик достаётся ему, а не программе под ним.</p>
+
   <div class="actions">
     <button id="reset" class="secondary">Сбросить значения</button>
   </div>
@@ -103,6 +121,9 @@
     roamPauseChance: (v) => v + ' %',
     roamPauseMin: (v) => v + ' с',
     roamPauseMax: (v) => v + ' с',
+    evadeRadius: (v) => v + ' px',
+    evadeDistance: (v) => v + ' px',
+    evadeSpeed: (v) => v + ' px/с',
   };
 
   const controls = [...document.querySelectorAll('[data-key]')];
@@ -125,7 +146,9 @@
       g.classList.toggle('off', !on);
       g.querySelector('input').disabled = !on;
     }
-    document.querySelector('label.check[data-group="roam"] input').disabled = !m.roam;
+    for (const l of document.querySelectorAll('label.check[data-group]')) {
+      l.querySelector('input').disabled = !m[l.dataset.group];
+    }
   }
 
   api.get().then((c) => {
